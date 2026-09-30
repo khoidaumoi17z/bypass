@@ -1,0 +1,128 @@
+name: Build VNBAPEX Bypass Online IPA
+on:
+  workflow_dispatch:
+    inputs:
+      config_url:
+        description: 'HTTPS config.json URL (leave blank to use this repository)'
+        required: false
+        type: string
+      config_branch:
+        description: 'Branch containing config.json'
+        default: main
+        type: string
+      signed:
+        description: 'Sign with your APPLE_* repository secrets'
+        default: false
+        type: boolean
+      export_method:
+        description: 'Certificate/profile type for signed build'
+        default: development
+        type: choice
+        options: [development, ad-hoc]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      GOTOOLCHAIN: local
+      SIGNED_BUILD: ${{ inputs.signed }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unpack VNBAPEX source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d VNBAPEX-Bypass-Online ]]; then
+            echo "PACKAGE_ROOT=$GITHUB_WORKSPACE/VNBAPEX-Bypass-Online" >> "$GITHUB_ENV"
+          else
+            unzip -q VNBAPEX-Bypass-Online-source.zip -d package
+            echo "PACKAGE_ROOT=$GITHUB_WORKSPACE/package/VNBAPEX-Bypass-Online" >> "$GITHUB_ENV"
+          fi
+      - name: Fetch pinned official VPN sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          lock=json.loads((Path(os.environ['PACKAGE_ROOT'])/'upstream-lock.json').read_text())
+          for key,path in [('apple','sing-box-for-apple'),('core','sing-box')]:
+              subprocess.run(['git','init',path],check=True)
+              subprocess.run(['git','-C',path,'remote','add','origin',lock[key+'_repository']],check=True)
+              subprocess.run(['git','-C',path,'fetch','--depth','1','origin',lock[key+'_revision']],check=True)
+              subprocess.run(['git','-C',path,'checkout','--detach','FETCH_HEAD'],check=True)
+          PY
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: sing-box/go.sum
+      - name: Prepare branding and HTTPS endpoint
+        env:
+          CUSTOM_CONFIG_URL: ${{ inputs.config_url }}
+          CONFIG_BRANCH: ${{ inputs.config_branch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess
+          from urllib.parse import quote
+          url=os.environ['CUSTOM_CONFIG_URL'].strip() or 'https://raw.githubusercontent.com/'+os.environ['GITHUB_REPOSITORY']+'/'+quote(os.environ['CONFIG_BRANCH'],safe='')+'/config.json'
+          subprocess.run(['python3',os.environ['PACKAGE_ROOT']+'/tools/prepare.py','sing-box-for-apple','--url',url],check=True)
+          PY
+          xcodebuild -version
+          xcrun swiftc -frontend -parse "$PACKAGE_ROOT/Overlay/Application.swift" "$PACKAGE_ROOT/Overlay/MainView.swift"
+      - name: Build actual sing-box core and validate JSON
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          git tag v1.14.6
+          if [[ -f .github/patch_go_for_ios.sh ]]; then bash .github/patch_go_for_ios.sh; fi
+          make lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go run -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api ./cmd/sing-box check -c "$PACKAGE_ROOT/config.json"
+          go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
+          test -f ../sing-box-for-apple/Libbox.xcframework/Info.plist
+      - name: Prepare optional Apple signing
+        if: inputs.signed
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_APP_PROFILE: ${{ secrets.APPLE_APP_PROFILE }}
+          APPLE_TUNNEL_PROFILE: ${{ secrets.APPLE_TUNNEL_PROFILE }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: python3 "$PACKAGE_ROOT/tools/signing.py" sing-box-for-apple
+      - name: Archive and package IPA
+        run: bash "$PACKAGE_ROOT/tools/package.sh" sing-box-for-apple "$GITHUB_WORKSPACE/artifacts"
+      - name: Save corresponding GPL sources
+        run: |
+          mkdir -p artifacts
+          tar --exclude=.git --exclude=Libbox.xcframework --exclude='*.keychain*' -czf artifacts/VNBAPEX-corresponding-source.tar.gz sing-box-for-apple sing-box "$PACKAGE_ROOT"
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: VNBAPEX-IPA
+          path: |
+            artifacts/*.ipa
+            artifacts/SHA256.txt
+          if-no-files-found: error
+      - name: Upload corresponding sources
+        uses: actions/upload-artifact@v7
+        with:
+          name: VNBAPEX-Source
+          path: artifacts/VNBAPEX-corresponding-source.tar.gz
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: VNBAPEX-Build-Logs
+          path: artifacts/*.log
+          if-no-files-found: ignore
+      - name: Remove temporary signing credentials
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/vnbapex-signing/build.keychain-db" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/vnbapex-signing"
